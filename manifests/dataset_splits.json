@@ -1,0 +1,16 @@
+{
+  "dataset": "FOMO50K",
+  "train_counts": {
+    "12p5": 6084,
+    "25": 12168,
+    "50": 24336,
+    "100": 48672
+  },
+  "validation_count": 491,
+  "input_shape": [
+    96,
+    96,
+    96
+  ],
+  "jepa_manifest_column": "img_path"
+}

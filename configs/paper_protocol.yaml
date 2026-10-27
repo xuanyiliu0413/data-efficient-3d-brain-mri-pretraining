@@ -1,0 +1,74 @@
+paper: 'Pretraining Data Scaling for Brain MRI Foundation Models: A Comparison of
+  MAE and JEPA'
+upstream:
+  dataset: FOMO50K
+  train_sizes:
+    12p5: 6084
+    '25': 12168
+    '50': 24336
+    '100': 48672
+  validation_size: 491
+  epochs: 100
+  input_shape:
+  - 96
+  - 96
+  - 96
+  patch_size:
+  - 16
+  - 16
+  - 16
+  selfmedmae:
+    batch_size: 16
+    optimizer: AdamW
+    mask_ratio: 0.75
+    base_lr: 0.00064
+    warmup_epochs: 1
+    scaled_learning_rate: 4.0e-05
+  jepa:
+    batch_size: 16
+    optimizer: AdamW
+    lr: 4.0e-05
+    warmup_epochs: 1
+    ema_momentum: 0.99925
+    mask_ratio: 0.75
+    mask_blocks:
+    - 32
+    - 16
+    - 4
+ixi:
+  subjects: 562
+  test_subjects: 113
+  warmup_epochs: 15
+  warmup_lr: 0.001
+  finetune_max_epochs: 150
+  encoder_lr: 5.0e-06
+  head_lr: 0.0001
+adni:
+  subjects: 828
+  folds: 5
+  encoder_frozen_epochs: 3
+  max_epochs: 25
+  encoder_lr: 5.0e-06
+  head_lr: 0.0003
+  selection_metric: validation_auc
+brats:
+  subjects: 1251
+  validation_subjects: 251
+  epochs: 60
+  seed: 123
+  data_seed: 123
+  ts_fold: 0
+  roi_size:
+  - 96
+  - 96
+  - 96
+  infer_overlap: 0.25
+  thresholds:
+    TC: 0.4
+    WT: 0.6
+    ET: 0.5
+  mae_25_best_checkpoint_epoch: 50
+bootstrap:
+  resamples: 20000
+  seed: 20261024
+  method: paired_case_level_percentile

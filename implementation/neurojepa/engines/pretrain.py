@@ -1,0 +1,357 @@
+import torch
+import math
+import time
+import logging
+import os
+from itertools import chain
+from typing import Any, Dict, Optional
+
+import torch.distributed as dist
+import torch.nn.functional as F
+
+from monai.utils import convert_to_tensor
+
+from neurojepa.models.utils.moe import moe_bias_update, calculate_vio_model
+from neurojepa.utils.misc import all_reduce_mean, save_checkpoint, MetricLogger, _update_momentum_encoder
+from neurojepa.loss.jepa_loss import loss_fn
+from neurojepa.utils.infinite_loader import InfiniteLoader
+
+
+def train_one_epoch(
+    cfg: Any,
+    model: torch.nn.Module,
+    iter_loader: Any,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    wd_scheduler: Any,
+    momentum_scheduler: Any,
+    moe_bias_scheduler: Any,
+    epoch: int,
+    max_epoch: int,
+    logger: Optional[logging.Logger] = None,
+    device: Optional[torch.device] = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
+    wandb_run: Optional[Any] = None,
+    use_moe: bool = False,
+    moe_params: Optional[Any] = None,
+) -> Dict[str, float]:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    metric_logger = MetricLogger(delimiter="  ", logger=logger)
+    encoder, target_encoder, predictor = model['encoder'], model['target_encoder'], model['predictor']
+    trainable_params = tuple(chain(encoder.parameters(), predictor.parameters()))
+
+    use_amp = cfg.optimization.mixed_precision
+    grad_clip = cfg.optimization.grad_clip
+    ipe = int(cfg.optimization.ipe)
+    dtype = cfg.meta.dtype
+    amp_dtype = torch.bfloat16 if dtype in ('bfloat16', torch.bfloat16) else torch.float16
+    use_grad_scaler = use_amp and amp_dtype == torch.float16
+    if use_amp and amp_dtype == torch.bfloat16 and scaler is not None:
+        if logger is not None:
+            logger.warning("Ignoring GradScaler for bfloat16 mixed precision; bf16 does not use loss scaling.")
+        scaler = None
+    if use_grad_scaler and scaler is None:
+        raise ValueError("float16 mixed precision requires a GradScaler, but scaler=None was provided.")
+
+
+    LOG_FREQ = getattr(cfg.log, 'log_freq', 100)
+    _loss_acc = torch.zeros(1, device=device, dtype=torch.float32)
+    _grad_norm_latest = torch.zeros((), device=device, dtype=torch.float32)
+    _acc_count = 0
+
+    for idx in range(ipe):
+        try:
+            batch_data = next(iter_loader)
+        except StopIteration:
+
+            logger.warning("StopIteration caught in train_one_epoch, which implies empty loader or InfiniteLoader failure.")
+            return {},
+
+
+        global_step = epoch * ipe + idx
+
+
+        all_packed_data, all_masks_enc, all_masks_pred = batch_data[:3]
+        fg_map = batch_data[3] if len(batch_data) > 3 else None
+        all_data, all_modality = all_packed_data[0], all_packed_data[1]
+
+
+        if all_data is not None and not isinstance(all_data, list):
+            all_data = [all_data]
+
+
+        data = [convert_to_tensor(d, track_meta=False).to(device, non_blocking=True) for d in all_data]
+
+
+        masks_enc = [[m.to(device, non_blocking=True) for m in all_masks_enc]]
+        masks_pred = [[m.to(device, non_blocking=True) for m in all_masks_pred]]
+        if fg_map is not None:
+            fg_map = fg_map.to(device, non_blocking=True)
+
+
+        with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+
+            with torch.no_grad():
+                h = target_encoder(data)
+                h = [F.layer_norm(hi, (hi.size(-1),)) for hi in h]
+
+
+            z, s = encoder(data, masks_enc)
+
+            z = predictor(z, masks_enc, masks_pred)
+
+            loss = loss_fn(z, h, masks_pred, cfg.loss.loss_exp, fg_map=fg_map,
+                          bg_weight=getattr(cfg.loss, 'bg_weight', 1.0))
+
+
+
+
+        if not use_grad_scaler:
+            _loss_check = loss.item()
+            if not math.isfinite(_loss_check):
+                logger.warning(f"Skipped a step with non-finite loss: {_loss_check}")
+                optimizer.zero_grad(set_to_none=True)
+                del loss, z, h, s, data, masks_enc, masks_pred
+                if fg_map is not None:
+                    del fg_map
+                torch.cuda.empty_cache()
+                continue
+
+
+
+        _new_lr = scheduler.step()
+        _new_wd = wd_scheduler.step()
+
+
+        grad_norm = None
+
+
+        _clip_max = grad_clip if grad_clip > 0 else float('inf')
+        if use_grad_scaler:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, _clip_max)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, _clip_max)
+            optimizer.step()
+
+
+        optimizer.zero_grad(set_to_none=True)
+
+
+        if use_moe:
+            if moe_params.moe_type == "bias":
+                bias_clip = moe_params.get("bias_clip", 1.0)
+                bias_update_rate = moe_bias_scheduler.step()
+                minvio, maxvio = moe_bias_update(encoder, bias_update_rate, used_ddp=True,
+                                                 bias_clip=bias_clip, use_proportional=True)
+            else:
+                minvio, maxvio = calculate_vio_model(encoder, used_ddp=True)
+
+
+        _new_m = next(momentum_scheduler)
+        with torch.no_grad():
+            _update_momentum_encoder(encoder, target_encoder, _new_m)
+
+
+        _loss_acc += loss.detach().float().nan_to_num()
+        if grad_norm is not None:
+            _grad_norm_latest = grad_norm.detach().float().nan_to_num()
+        _acc_count += 1
+
+
+        if (_acc_count >= LOG_FREQ or (idx + 1) == ipe) and _acc_count > 0:
+            _reduced_loss = all_reduce_mean(_loss_acc / _acc_count)
+            loss_value = _reduced_loss.item() if isinstance(_reduced_loss, torch.Tensor) else float(_reduced_loss)
+            _reduced_grad_norm = all_reduce_mean(_grad_norm_latest)
+            grad_norm_value = (
+                _reduced_grad_norm.item()
+                if isinstance(_reduced_grad_norm, torch.Tensor)
+                else float(_reduced_grad_norm)
+            )
+
+            metric_logger.update(
+                loss=loss_value,
+                lr=_new_lr,
+                wd=_new_wd,
+                mom=_new_m,
+                grad_norm=grad_norm_value,
+                global_step=global_step,
+            )
+
+            logger.info(f"Epoch {epoch+1}/{max_epoch} [{idx+1}/{ipe}]  Loss(avg {_acc_count} steps): {loss_value:.4f}")
+
+            if dist.get_rank() == 0 and wandb_run is not None:
+                log_dict = {
+                    "Training Loss": loss_value,
+                    "Training lr":   _new_lr,
+                    "Training wd":   _new_wd,
+                    "Momentum":      _new_m,
+                    "Grad Norm":     grad_norm_value,
+                    "Epoch":         epoch + 1,
+                }
+                if use_moe:
+                    log_dict["MoE MinVio"] = minvio
+                    log_dict["MoE MaxVio"] = maxvio
+                    if moe_params.moe_type == "bias":
+                        log_dict["MoE Bias Update Rate"] = bias_update_rate
+                wandb_run.log(log_dict, step=global_step)
+
+
+            _loss_acc.zero_()
+            _grad_norm_latest.zero_()
+            _acc_count = 0
+
+
+    metric_logger.synchronize_between_processes()
+    logger.info(f"Averaged stats: {metric_logger}")
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+def trainer(
+    cfg: Any,
+    model: Dict[str, torch.nn.Module],
+    loader: torch.utils.data.DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    wd_scheduler: Any,
+    momentum_scheduler: Any,
+    moe_bias_scheduler: Any,
+    start_epoch: int = 0,
+    max_epoch: int = 100,
+    logger: Optional[logging.Logger] = None,
+    device: Optional[torch.device] = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
+    wandb_run: Optional[Any] = None,
+    use_moe: bool = False,
+    moe_params: Optional[Any] = None,
+) -> float:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    dtype = cfg.meta.dtype
+    amp_dtype = torch.bfloat16 if dtype in ('bfloat16', torch.bfloat16) else torch.float16
+    if cfg.optimization.mixed_precision and amp_dtype == torch.bfloat16 and scaler is not None:
+        if logger is not None:
+            logger.warning("Ignoring GradScaler for bfloat16 mixed precision; bf16 does not use loss scaling.")
+        scaler = None
+
+    iter_loader = InfiniteLoader(loader, start_epoch=start_epoch)
+
+    for epoch in range(start_epoch, max_epoch):
+        logger.info(f"Epoch: {epoch+1}")
+        epoch_time = time.time()
+
+        train_stats = train_one_epoch(
+            cfg=cfg,
+            model=model,
+            iter_loader=iter_loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            wd_scheduler=wd_scheduler,
+            momentum_scheduler=momentum_scheduler,
+            moe_bias_scheduler=moe_bias_scheduler,
+            epoch=epoch,
+            max_epoch=max_epoch,
+            logger=logger,
+            device=device,
+            scaler=scaler,
+            wandb_run=wandb_run,
+            use_moe=use_moe,
+            moe_params=moe_params,
+        )
+
+        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 'epoch': epoch}
+        logger.info(f"log_stats: {log_stats}")
+
+        if dist.get_rank() == 0:
+            logger.info(
+                f"Final training stats for epoch {epoch+1}/{max_epoch}: {log_stats}, "
+                f"time: {time.time() - epoch_time:.2f}s"
+            )
+
+
+        global_step = (epoch + 1) * int(cfg.optimization.ipe)
+
+
+        if dist.get_rank() == 0:
+
+            if not os.path.exists(cfg.meta.save_path_checkpoint):
+                os.makedirs(cfg.meta.save_path_checkpoint, exist_ok=True)
+
+
+            save_path = os.path.join(cfg.meta.save_path_checkpoint, "latest.pt")
+            save_checkpoint(
+                model["encoder"],
+                model["target_encoder"],
+                model["predictor"],
+                optimizer=optimizer,
+                scaler=scaler,
+                epoch=epoch,
+                loss=train_stats['loss'],
+                path=save_path,
+                global_step=global_step,
+            )
+
+
+            if epoch == 0 or (epoch + 1) % cfg.meta.save_checkpoint_freq == 0:
+                save_path = os.path.join(cfg.meta.save_path_checkpoint, f"e{epoch+1}.pt")
+                save_checkpoint(
+                    model["encoder"],
+                    model["target_encoder"],
+                    model["predictor"],
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    epoch=epoch,
+                    loss=train_stats['loss'],
+                    path=save_path,
+                    global_step=global_step,
+                )
+
+    logger.info(f"Training Finished after {max_epoch} epochs.")
+    return train_stats['loss']

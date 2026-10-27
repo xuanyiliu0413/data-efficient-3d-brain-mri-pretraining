@@ -1,0 +1,24 @@
+# Local data and training artefacts.
+/data/
+/outputs/
+/checkpoints/
+/wandb/
+
+__pycache__/
+*.py[cod]
+
+*.pt
+*.pth
+*.ckpt
+*.nii
+*.nii.gz
+*.npy
+*.npz
+*.pkl
+*.dcm
+*.h5
+*.tar
+*.tar.gz
+
+.env
+.env.*

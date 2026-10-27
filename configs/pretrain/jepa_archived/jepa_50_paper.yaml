@@ -1,0 +1,141 @@
+data:
+  dataset_type: 3D-MRI
+  train_csv_path: data/fomo50k/manifests/jepa_50_train.csv
+  cache_dir: null
+  batch_size: 16
+  img_size:
+  - 96
+  - 96
+  - 96
+  patch_size:
+  - 16
+  - 16
+  - 16
+  num_workers: 2
+  pin_mem: true
+  foreground_threshold: 0.0
+  min_foreground_fraction: 0.1
+data_aug:
+  auto_augment: false
+loss:
+  loss_name: l1
+  loss_exp: 1.0
+  bg_weight: 0.1
+mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  num_blocks: 32
+  total_mask_ratio: 0.75
+  spatial_scale:
+  - 0.0
+  - 0.2
+  depth_scale:
+  - 0.0
+  - 1.0
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  num_blocks: 16
+  total_mask_ratio: 0.75
+  spatial_scale:
+  - 0.2
+  - 0.5
+  depth_scale:
+  - 0.0
+  - 1.0
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  num_blocks: 4
+  total_mask_ratio: 0.75
+  spatial_scale:
+  - 0.5
+  - 0.7
+  depth_scale:
+  - 0.0
+  - 1.0
+meta:
+  dtype: bfloat16
+  eval_freq: 100
+  load_checkpoint: false
+  load_path_checkpoint: null
+  save_path_checkpoint: outputs/jepa_50/checkpoints
+  read_checkpoint: null
+  save_checkpoint_freq: 25
+  seed: 42
+  use_sdpa: true
+  compile_model: false
+model:
+  model_name: jepa
+  backbone_name: vit_base
+  img_size:
+  - 96
+  - 96
+  - 96
+  patch_size:
+  - 16
+  - 16
+  - 16
+  in_chans: 1
+  pred_depth: 12
+  pred_embed_dim: 384
+  pred_num_heads: 12
+  uniform_power: true
+  use_activation_checkpointing: false
+  use_mask_tokens: true
+  use_rope: true
+  use_silu: false
+  use_pred_silu: false
+  wide_silu: true
+  zero_init_mask_tokens: true
+  foreground_aware: false
+  use_moe: false
+  moe_params:
+    moe_type: bias
+    dim: 768
+    n_shared_experts: 2
+    n_routed_experts: 16
+    n_activated_experts: 6
+    moe_inter_dim: 384
+    score_func: softmax
+    route_scale: 4.0
+    bias_clip: 0.3
+    bias_update_rate: 0.0001
+    bias_update_rate_min: 0.0001
+    bias_update_rate_max: 0.0001
+    moe_layer_indices:
+    - 1
+    - 3
+    - 5
+    - 7
+    - 9
+    - 11
+optimization:
+  is_anneal: false
+  ema:
+  - 0.99925
+  - 0.99925
+  num_epochs: 100
+  final_lr: 0.0
+  final_weight_decay: 0.05
+  ipe: -1
+  ipe_scale: 1.0
+  lr: 4.0e-05
+  start_lr: 0.0
+  warmup: 1
+  weight_decay: 0.05
+  grad_clip: 1.0
+  mixed_precision: true
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+log:
+  filename: jepa_50_bs16
+  log_freq: 100
+  output_dir: outputs/jepa_50/logs
+wandb:
+  project: Neuro-JEPA-Pretrain-base
+  entity: your-entity
+  wandb_enable: false
